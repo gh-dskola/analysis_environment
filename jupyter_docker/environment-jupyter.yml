@@ -1,0 +1,9 @@
+name: jupyter
+channels:
+  - nodefaults
+  - conda-forge
+  - bioconda
+dependencies:
+  - python
+  - jupyter
+  - ipykernel
