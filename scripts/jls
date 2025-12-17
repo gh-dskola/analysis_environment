@@ -14,7 +14,7 @@ for ((PORT=MIN_PORT;PORT<=MAX_PORT;PORT++)); do
         echo "============================================================"
         echo ""
 
-        docker run -e HOST_NAME=$HOST_NAME -e HOST_PORT=$PORT -p $PORT:8888 dskola_jls:latest
+        docker run -e HOST_NAME=$HOST_NAME -e HOST_PORT=$PORT -p $PORT:8888 --mount type=bind,src=/$HOME/workspace,dst=/workspace dskola_jls:latest
         STATUS=$?
         echo Status: $STATUS        
         if [[ $STATUS -le 1 ]]; then

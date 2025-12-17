@@ -1,0 +1,2 @@
+#!/bin/bash
+docker build -t dskola_jls:latest $HOME/workspace/analysis_environment/jupyter_docker/
