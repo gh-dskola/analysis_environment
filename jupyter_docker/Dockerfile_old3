@@ -1,9 +1,8 @@
 # Use a micromamba base image for better non-root support
 # FROM mambaorg/micromamba:latest
-FROM debian:bookworm
-RUN echo 'deb http://deb.debian.org/debian bookworm-backports main' > /etc/apt/sources.list.d/backports.list
+FROM condaforge/miniforge3
 
-LABEL container.base.image="debian:bookworm"
+LABEL container.base.image="condaforge/miniforge3"
 LABEL software.name="dskola_base_jupyter"
 LABEL software.description="General-purpose jupyter lab server"
 
@@ -15,13 +14,15 @@ ARG USER_NAME=root
 # RUN echo GID $USER_GID
 
 USER root
-ENV SHELL=/bin/bash
 
 RUN apt-get update --fix-missing && apt-get install -y wget bzip2 ca-certificates \
     libglib2.0-0 libxext6 libsm6 libxrender1 \
-    git mercurial subversion libz-dev libopencv-dev\
-    vim \
+    git mercurial subversion libz-dev \
     --reinstall build-essential
+
+WORKDIR /app
+COPY launch_jupyter.sh .
+RUN chmod 755 launch_jupyter.sh
 
 # Create the user and set their home directory
 RUN groupadd -g $USER_GID "domain"
@@ -30,38 +31,22 @@ RUN useradd -m -u $USER_UID -g $USER_GID -s /bin/bash $USER_NAME
 # Switch to the non-root user
 USER $USER_NAME
 ENV HOME=/home/$USER_NAME
-# ENV MAMBA_ROOT_PREFIX=$HOME/local/share/mamba
-
-WORKDIR $HOME/build
-RUN wget -O Miniforge3.sh https://github.com/conda-forge/miniforge/releases/download/25.11.0-1/Miniforge3-25.11.0-1-Linux-x86_64.sh
-RUN bash Miniforge3.sh -b -p "${HOME}/conda"
-RUN rm Miniforge3.sh
-ENV PATH=$HOME/conda/bin:${PATH}
-RUN bash -c "source ${HOME}/conda/etc/profile.d/conda.sh"
-RUN bash -c "source ${HOME}/conda/etc/profile.d/mamba.sh"
+ENV MAMBA_ROOT_PREFIX=$HOME/local/share/mamba
 
 # RUN mamba shell init --shell bash --root-prefix=$MAMBA_ROOT_PREFIX
 # RUN eval "$(micromamba shell hook --shell bash)
 # RUN micromamba activate
 # RUN micromamba install -y mamba
 
+WORKDIR /build
 COPY environment-jupyter.yml .
 RUN mamba create -n jupyter -f environment-jupyter.yml -y
 ENV ENV_NAME=jupyter
 
-RUN conda init
 COPY environment-bnfo-base.yml .
 RUN mamba create -n bnfo-base -f environment-bnfo-base.yml -y
-#RUN conda activate bnfo-base
-#RUN mamba install -y ipykernel
-#RUN conda activate jupyter
+RUN mamba install -y -n bnfo-base ipykernel
 
-USER root
-WORKDIR /app
-COPY launch_jupyter.sh .
-RUN chmod 755 launch_jupyter.sh
-
-USER $USER_NAME
 WORKDIR $HOME
 
 ENTRYPOINT ["/bin/bash", "/app/launch_jupyter.sh"]

@@ -1,0 +1,49 @@
+# Use a micromamba base image for better non-root support
+FROM mambaorg/micromamba:latest
+
+LABEL container.base.image="mambaorg/micromamba:latest"
+LABEL software.name="dskola_base_jupyter"
+LABEL software.description="General-purpose jupyter lab server"
+
+ARG USER_UID=0
+ARG USER_GID=0
+ARG USER_NAME=root
+
+# RUN echo UID $USER_UID
+# RUN echo GID $USER_GID
+
+USER root
+
+RUN apt-get update --fix-missing && apt-get install -y wget bzip2 ca-certificates \
+    libglib2.0-0 libxext6 libsm6 libxrender1 \
+    git mercurial subversion libz-dev \
+    --reinstall build-essential
+
+# Create the user and set their home directory
+RUN groupadd -g $USER_GID "domain"
+RUN useradd -m -u $USER_UID -g $USER_GID -s /bin/bash $USER_NAME
+
+# Switch to the non-root user
+USER $USER_NAME
+
+ENV MAMBA_ROOT_PREFIX=./local/share/mamba
+
+RUN micromamba shell init --shell bash --root-prefix=$MAMBA_ROOT_PREFIX
+# RUN eval "$(micromamba shell hook --shell bash)
+# RUN micromamba activate
+# RUN micromamba install -y mamba
+
+WORKDIR /build
+COPY environment-jupyter.yml .
+RUN micromamba create -n jupyter -f environment-jupyter.yml -y
+ENV ENV_NAME=jupyter
+
+COPY environment-bnfo-base.yml .
+RUN micromamba create -n bnfo-base -f environment-bnfo-base.yml -y
+RUN micromamba install -y -n bnfo-base ipykernel
+
+WORKDIR /app
+COPY launch_jupyter.sh .
+
+ENTRYPOINT ["/bin/bash", "/app/launch_jupyter.sh"]
+

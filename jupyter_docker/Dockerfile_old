@@ -1,0 +1,19 @@
+FROM condaforge/miniforge3
+
+WORKDIR /build
+
+COPY environment-jupyter.yml .
+RUN mamba create -f environment-jupyter.yml
+COPY environment-bnfo-base.yml .
+RUN mamba create -f environment-bnfo-base.yml
+
+WORKDIR /app
+COPY launch_jupyter.sh .
+
+# Set permissions for non-root users to access
+RUN CHMOD -R 755 /app/*
+RUN CHMOD -R 755 /app/conda/*
+
+
+ENTRYPOINT ["bash", "/app/launch_jupyter.sh"]
+

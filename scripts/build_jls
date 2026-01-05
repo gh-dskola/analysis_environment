@@ -1,2 +1,5 @@
 #!/bin/bash
-docker build -t dskola_jls:latest $HOME/workspace/analysis_environment/jupyter_docker/
+set -uxo pipefail
+docker build --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g) --build-arg USER_NAME=dskola -t  dskola_jls:latest $HOME/workspace/analysis_environment/jupyter_docker/
+docker tag  dskola_jls:latest docker-scratch.artifactory01.ghdna.io/dskola_jls:latest
+# docker push docker-scratch.artifactory01.ghdna.io/dskola_jls:latest

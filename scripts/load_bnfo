@@ -1,0 +1,3 @@
+#!/bin/bash
+set -uxo pipefail
+docker image load -i /ghdevhome/home/dskola/docker/dskola_bnfo_latest.tar.gz

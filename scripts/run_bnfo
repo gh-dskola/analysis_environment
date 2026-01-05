@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+IMAGE_NAME=dskola_bnfo:latest
+CID_FILE=$HOME/docker_tracking/bnfo_latest.cid
+
+rm -f $CID_FILE
+docker run -it --init -u $(id -u):$(id -g) --mount type=bind,src=$HOME/workspace,dst=/workspace --mount type=bind,src=/screening,dst=/screening --entrypoint /bin/bash --cidfile $CID_FILE $IMAGE_NAME
+STATUS=$?
+echo "Status: $STATUS"
+        
+if [[ $STATUS -le 1 ]]; then
+    CONTAINER_ID=$(cat $CID_FILE)
+    echo "Ran $IMAGE_NAME as $CONTAINER_ID successfully (terminated normally or by TERM signal)"
+    echo "Committing $CONTAINER_ID to $IMAGE_NAME ..."
+    docker commit $CONTAINER_ID $IMAGE_NAME
+fi

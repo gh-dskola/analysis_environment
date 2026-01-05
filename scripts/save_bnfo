@@ -1,0 +1,3 @@
+#!/bin/bash
+set -uxo pipefail
+docker save dskola_bnfo:latest | gzip > $HOME/docker/dskola_bnfo_latest.tar.gz

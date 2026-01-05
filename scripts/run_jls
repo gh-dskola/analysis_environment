@@ -1,0 +1,5 @@
+#!/bin/bash
+set -uxo pipefail
+IMAGE_NAME=dskola_jls:latest
+
+docker run -it --init -u $(id -u):$(id -g) --mount type=bind,src=$HOME/workspace,dst=/workspace --entrypoint /bin/bash $IMAGE_NAME 

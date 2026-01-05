@@ -1,0 +1,5 @@
+#!/bin/bash
+set -uxo pipefail
+CID_FILE=$HOME/docker_tracking/jls_latest.cid
+CONTAINER_ID=$(cat $CID_FILE)
+docker exec -it $CONTAINER_ID /bin/bash

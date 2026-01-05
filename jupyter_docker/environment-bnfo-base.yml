@@ -17,6 +17,9 @@ dependencies:
   - keyutils=1.6.1
   - krb5=1.21.3
   - ld_impl_linux-aarch64=2.44
+  - ipykernel
+  - ipywidgets
+  - jupyter
   - libasprintf=0.25.1
   - libcurl=8.14.1
   - libedit=3.1.20250104
@@ -78,3 +81,4 @@ dependencies:
   - scikit-learn
   - matplotlib
   - seaborn
+  - mamba
