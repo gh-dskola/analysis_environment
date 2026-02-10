@@ -1,0 +1,2 @@
+#!/bin/bash
+docker login -u ghbi_service -p Password123 docker-scratch.artifactory01.ghdna.io

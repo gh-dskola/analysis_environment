@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""
+Check Nextflow pipeline status and provide structured summary.
+
+Usage:
+    check_pipeline_status.py --outdir /path/to/pipeline/output [options]
+
+Outputs YAML summary with:
+- Overall pipeline status
+- Per-sample progress
+- Process-level statistics
+- Active SLURM jobs
+- Errors and retry reasons
+- Cached task information
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import yaml
+
+
+@dataclass
+class TaskInfo:
+    """Information about a single task execution."""
+    task_id: str
+    process: str
+    sample: str
+    status: str
+    exit_code: Optional[int] = None
+    duration: Optional[str] = None
+    cached: bool = False
+    retry_count: int = 0
+    error_message: Optional[str] = None
+    work_dir: Optional[str] = None
+
+
+@dataclass
+class SampleStatus:
+    """Track the status of each sample through the pipeline."""
+    sample_id: str
+    current_stage: str = "unknown"
+    stages_complete: list = field(default_factory=list)
+    has_error: bool = False
+    error_details: Optional[str] = None
+    retry_count: int = 0
+
+
+@dataclass
+class PipelineStatus:
+    """Overall pipeline status."""
+    status: str = "unknown"
+    started: Optional[str] = None
+    duration: Optional[str] = None
+    completed_at: Optional[str] = None
+    work_dir: Optional[str] = None
+    total_tasks: int = 0
+    succeeded: int = 0
+    cached: int = 0
+    failed: int = 0
+    running: int = 0
+    pending: int = 0
+    retries: int = 0
+
+
+# Define pipeline stage order for progress tracking
+STAGE_ORDER = [
+    "RECORD_RUN_METADATA",
+    "BUILD_ALIGNMENT_CONTAINER",
+    "TRIM_ALIGN_SORT",
+    "SPLIT_FASTQ",
+    "TRIM_ALIGN_SORT_PART",
+    "MERGE_SORTED_BAMS",
+    "MARK_DUPLICATES",
+    "INDEX_BAM",
+    "BUILD_MANTA_CONTAINER",
+    "BUILD_MANTA_POST_CONTAINER",
+    "MANTA_SOMATIC",
+    "POST_PROCESS_MANTA",
+]
+
+
+def parse_execution_trace(trace_path: Path) -> dict[str, TaskInfo]:
+    """Parse execution_trace.txt for task information."""
+    tasks = {}
+
+    if not trace_path.exists():
+        return tasks
+
+    with open(trace_path) as f:
+        header = None
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split('\t')
+
+            if header is None:
+                header = parts
+                continue
+
+            if len(parts) < len(header):
+                continue
+
+            row = dict(zip(header, parts))
+
+            task_id = row.get('hash', row.get('task_id', ''))
+            name = row.get('name', '')
+            status = row.get('status', '')
+            exit_code = row.get('exit', '')
+            duration = row.get('duration', row.get('realtime', ''))
+            work_dir = row.get('workdir', '')
+
+            # Extract process name and sample from task name
+            # Format: "workflow:SUBWORKFLOW:PROCESS (sample_id)"
+            process = ""
+            sample = ""
+            if name:
+                # Extract process name (last part before parentheses)
+                process_match = re.search(r':?([A-Z_]+)\s*\(', name)
+                if process_match:
+                    process = process_match.group(1)
+
+                # Extract sample ID from parentheses
+                sample_match = re.search(r'\(([^)]+)\)', name)
+                if sample_match:
+                    sample = sample_match.group(1)
+                    # Clean up sample name (remove _tumor, _normal, part info)
+                    sample = re.sub(r'_(tumor|normal).*$', '', sample)
+                    sample = re.sub(r'_part\d+$', '', sample)
+
+            task = TaskInfo(
+                task_id=task_id,
+                process=process,
+                sample=sample,
+                status=status,
+                exit_code=int(exit_code) if exit_code and exit_code != '-' else None,
+                duration=duration if duration and duration != '-' else None,
+                cached=status == 'CACHED',
+                work_dir=work_dir,
+            )
+
+            # Use task_id + process + sample as key to handle retries
+            key = f"{task_id}:{process}:{sample}"
+            tasks[key] = task
+
+    return tasks
+
+
+def parse_nextflow_log(log_path: Path) -> tuple[PipelineStatus, list[dict]]:
+    """Parse nextflow.log for pipeline status and error details."""
+    pipeline = PipelineStatus()
+    errors = []
+    retries = defaultdict(list)
+
+    if not log_path.exists():
+        return pipeline, errors
+
+    with open(log_path) as f:
+        content = f.read()
+
+    # Extract start time
+    start_match = re.search(r'(\w{3}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+).*Session.*', content)
+    if start_match:
+        pipeline.started = start_match.group(1)
+
+    # Extract work directory
+    workdir_match = re.search(r"Work Dir\s*:\s*(\S+)", content)
+    if workdir_match:
+        pipeline.work_dir = workdir_match.group(1)
+
+    # Check if pipeline completed
+    if "Workflow completed" in content or "Pipeline completed" in content:
+        pipeline.status = "completed"
+
+        # Extract completion time
+        complete_match = re.search(r'Completed at\s*:\s*(.+)', content)
+        if complete_match:
+            pipeline.completed_at = complete_match.group(1).strip()
+
+        # Extract duration
+        duration_match = re.search(r'Duration\s*:\s*(.+)', content)
+        if duration_match:
+            pipeline.duration = duration_match.group(1).strip()
+    else:
+        pipeline.status = "running"
+
+    # Extract task summary if available
+    succeeded_match = re.search(r'Succeeded\s*:\s*(\d+)', content)
+    if succeeded_match:
+        pipeline.succeeded = int(succeeded_match.group(1))
+
+    cached_match = re.search(r'Cached\s*:\s*(\d+)', content)
+    if cached_match:
+        pipeline.cached = int(cached_match.group(1))
+
+    failed_match = re.search(r'Failed\s*:\s*(\d+)', content)
+    if failed_match:
+        pipeline.failed = int(failed_match.group(1))
+
+    # Find retry events and their reasons
+    retry_pattern = re.compile(
+        r'Process `([^`]+)` terminated with an error exit status \((\d+)\) -- Execution is retried \((\d+)\)'
+    )
+    for match in retry_pattern.finditer(content):
+        process_name = match.group(1)
+        exit_code = int(match.group(2))
+        retry_num = int(match.group(3))
+
+        # Extract sample from process name
+        sample_match = re.search(r'\(([^)]+)\)', process_name)
+        sample = sample_match.group(1) if sample_match else "unknown"
+
+        # Extract just the process type
+        process_match = re.search(r':([A-Z_]+)\s*\(', process_name)
+        process = process_match.group(1) if process_match else process_name
+
+        retries[f"{process}:{sample}"].append({
+            "retry_num": retry_num,
+            "exit_code": exit_code,
+        })
+
+    # Find error messages in log
+    error_pattern = re.compile(
+        r'(\w{3}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+).*ERROR.*?(?:Process `([^`]+)`.*?|)(?:error[:\s]+(.+?)(?:\n|$))',
+        re.IGNORECASE
+    )
+
+    # Also look for specific error patterns
+    for process_sample, retry_list in retries.items():
+        process, sample = process_sample.split(':', 1)
+        latest_retry = max(retry_list, key=lambda x: x['retry_num'])
+
+        errors.append({
+            "sample": sample,
+            "process": process,
+            "exit_code": latest_retry['exit_code'],
+            "retry_count": latest_retry['retry_num'],
+            "error_message": None,  # Will be populated from .command.err if found
+        })
+
+    pipeline.retries = sum(len(v) for v in retries.values())
+
+    return pipeline, errors
+
+
+def get_error_from_workdir(work_dir: str) -> Optional[str]:
+    """Extract error message from task's .command.err file."""
+    if not work_dir:
+        return None
+
+    err_file = Path(work_dir) / ".command.err"
+    if not err_file.exists():
+        return None
+
+    try:
+        with open(err_file) as f:
+            content = f.read().strip()
+
+        # Return last few lines if content is long
+        lines = content.split('\n')
+        if len(lines) > 5:
+            return '\n'.join(lines[-5:])
+        return content if content else None
+    except Exception:
+        return None
+
+
+def find_error_workdir(outdir: Path, process: str, sample: str) -> Optional[str]:
+    """Find work directory for a failed task by searching logs."""
+    log_path = outdir / "logs" / "nextflow.log"
+    if not log_path.exists():
+        return None
+
+    # Search for the work directory in the log
+    pattern = re.compile(
+        rf'submitted process.*{process}.*{re.escape(sample)}.*workDir:\s*(\S+)',
+        re.IGNORECASE
+    )
+
+    with open(log_path) as f:
+        content = f.read()
+
+    matches = list(pattern.finditer(content))
+    if matches:
+        # Return the most recent match
+        return matches[-1].group(1)
+
+    return None
+
+
+def get_slurm_jobs(user: str, job_prefix: str) -> list[dict]:
+    """Get currently running/pending SLURM jobs."""
+    jobs = []
+
+    try:
+        result = subprocess.run(
+            ['squeue', '-u', user, '-o', '%i|%j|%T|%M|%N|%r'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            return jobs
+
+        lines = result.stdout.strip().split('\n')
+        if len(lines) < 2:
+            return jobs
+
+        for line in lines[1:]:  # Skip header
+            parts = line.split('|')
+            if len(parts) >= 6:
+                job_name = parts[1]
+                if job_prefix and not job_name.startswith(job_prefix):
+                    continue
+
+                jobs.append({
+                    "job_id": parts[0],
+                    "name": job_name,
+                    "state": parts[2],
+                    "time": parts[3],
+                    "node": parts[4],
+                    "reason": parts[5] if parts[5] != "(null)" else None,
+                })
+    except Exception as e:
+        pass
+
+    return jobs
+
+
+def parse_console_output(log_path: Path) -> dict:
+    """Parse the console output log for current progress."""
+    progress = {
+        "processes": {},
+        "samples_complete": set(),
+    }
+
+    # Try to find console output in the log
+    if not log_path.exists():
+        return progress
+
+    with open(log_path) as f:
+        content = f.read()
+
+    # Find "Manta SV calling complete" messages
+    complete_pattern = re.compile(r'Manta SV calling complete:\s*(\S+)\s*->')
+    for match in complete_pattern.finditer(content):
+        progress["samples_complete"].add(match.group(1))
+
+    # Parse process status lines like:
+    # [hash] process_name | X of Y, cached: Z
+    process_pattern = re.compile(
+        r'\[([^\]]+)\]\s+(\S+)\s+\|\s+(\d+)\s+of\s+(\d+)(?:,\s*cached:\s*(\d+))?(?:,\s*retries:\s*(\d+))?'
+    )
+
+    # Get the last occurrence of each process
+    process_status = {}
+    for match in process_pattern.finditer(content):
+        hash_id = match.group(1)
+        process_name = match.group(2)
+        completed = int(match.group(3))
+        total = int(match.group(4))
+        cached = int(match.group(5)) if match.group(5) else 0
+        retries = int(match.group(6)) if match.group(6) else 0
+
+        # Clean up process name (remove truncation artifacts)
+        process_name = re.sub(r'^fro…', 'from_fastq:', process_name)
+        process_name = re.sub(r'…', '', process_name)
+
+        process_status[process_name] = {
+            "completed": completed,
+            "total": total,
+            "cached": cached,
+            "retries": retries,
+        }
+
+    progress["processes"] = process_status
+
+    return progress
+
+
+def determine_sample_status(
+    tasks: dict[str, TaskInfo],
+    complete_samples: set[str],
+    all_samples: set[str],
+) -> dict[str, SampleStatus]:
+    """Determine the current status of each sample."""
+    sample_status = {}
+
+    # Group tasks by sample
+    tasks_by_sample = defaultdict(list)
+    for task in tasks.values():
+        if task.sample:
+            # Normalize sample name
+            sample = re.sub(r'_(tumor|normal).*$', '', task.sample)
+            tasks_by_sample[sample].append(task)
+
+    for sample in all_samples:
+        status = SampleStatus(sample_id=sample)
+
+        if sample in complete_samples:
+            status.current_stage = "COMPLETE"
+            status.stages_complete = STAGE_ORDER.copy()
+        else:
+            sample_tasks = tasks_by_sample.get(sample, [])
+
+            # Find completed stages
+            completed_processes = set()
+            latest_stage = None
+            latest_stage_idx = -1
+            has_running = False
+
+            for task in sample_tasks:
+                if task.status in ('COMPLETED', 'CACHED'):
+                    completed_processes.add(task.process)
+                elif task.status == 'RUNNING':
+                    has_running = True
+                    if task.process in STAGE_ORDER:
+                        idx = STAGE_ORDER.index(task.process)
+                        if idx > latest_stage_idx:
+                            latest_stage_idx = idx
+                            latest_stage = task.process
+
+                # Track errors
+                if task.exit_code and task.exit_code != 0:
+                    status.has_error = True
+                    status.error_details = f"Exit code {task.exit_code} in {task.process}"
+                    status.retry_count = max(status.retry_count, task.retry_count)
+
+            status.stages_complete = [s for s in STAGE_ORDER if s in completed_processes]
+
+            if has_running and latest_stage:
+                status.current_stage = f"{latest_stage} (running)"
+            elif status.stages_complete:
+                # Find next expected stage
+                last_complete_idx = max(
+                    STAGE_ORDER.index(s) for s in status.stages_complete
+                    if s in STAGE_ORDER
+                )
+                if last_complete_idx < len(STAGE_ORDER) - 1:
+                    status.current_stage = status.stages_complete[-1]
+                else:
+                    status.current_stage = "COMPLETE"
+            else:
+                status.current_stage = "PENDING"
+
+        sample_status[sample] = status
+
+    return sample_status
+
+
+def generate_summary(
+    outdir: Path,
+    user: str,
+    job_prefix: str,
+    samples: Optional[list[str]] = None,
+) -> dict:
+    """Generate complete pipeline status summary."""
+
+    trace_path = outdir / "logs" / "execution_trace.txt"
+    log_path = outdir / "logs" / "nextflow.log"
+
+    # Parse all data sources
+    tasks = parse_execution_trace(trace_path)
+    pipeline, errors = parse_nextflow_log(log_path)
+    slurm_jobs = get_slurm_jobs(user, job_prefix)
+    console_progress = parse_console_output(log_path)
+
+    # Get error details from work directories
+    for error in errors:
+        work_dir = find_error_workdir(outdir, error['process'], error['sample'])
+        if work_dir:
+            error['error_message'] = get_error_from_workdir(work_dir)
+            error['work_dir'] = work_dir
+
+    # Determine all samples
+    all_samples = set()
+    if samples:
+        all_samples = set(samples)
+    else:
+        # Extract from tasks
+        for task in tasks.values():
+            if task.sample:
+                sample = re.sub(r'_(tumor|normal).*$', '', task.sample)
+                all_samples.add(sample)
+
+    complete_samples = console_progress.get("samples_complete", set())
+    sample_status = determine_sample_status(tasks, complete_samples, all_samples)
+
+    # Calculate cached statistics
+    cached_tasks = [t for t in tasks.values() if t.cached]
+    cached_by_process = defaultdict(int)
+    for task in cached_tasks:
+        cached_by_process[task.process] += 1
+
+    # Build summary
+    summary = {
+        "pipeline": {
+            "status": pipeline.status,
+            "started": pipeline.started,
+            "duration": pipeline.duration,
+            "completed_at": pipeline.completed_at,
+            "work_dir": pipeline.work_dir,
+        },
+        "task_summary": {
+            "total": len(tasks),
+            "succeeded": pipeline.succeeded,
+            "cached": pipeline.cached,
+            "failed": pipeline.failed,
+            "retries": pipeline.retries,
+        },
+        "samples": {
+            "total": len(all_samples),
+            "complete": sorted(list(complete_samples)),
+            "in_progress": {},
+            "failed": [],
+        },
+        "cached_tasks": {
+            "total": len(cached_tasks),
+            "by_process": dict(cached_by_process),
+        },
+        "active_jobs": {
+            "count": len(slurm_jobs),
+            "jobs": slurm_jobs,
+        },
+        "errors": errors,
+        "process_progress": console_progress.get("processes", {}),
+    }
+
+    # Categorize samples
+    for sample_id, status in sample_status.items():
+        if status.current_stage == "COMPLETE":
+            if sample_id not in summary["samples"]["complete"]:
+                summary["samples"]["complete"].append(sample_id)
+        elif status.has_error:
+            summary["samples"]["failed"].append({
+                "sample": sample_id,
+                "stage": status.current_stage,
+                "error": status.error_details,
+                "retries": status.retry_count,
+            })
+        else:
+            summary["samples"]["in_progress"][sample_id] = status.current_stage
+
+    summary["samples"]["complete"] = sorted(summary["samples"]["complete"])
+
+    return summary
+
+
+def format_output(summary: dict, format: str) -> str:
+    """Format summary for output."""
+    if format == "json":
+        return json.dumps(summary, indent=2, default=str)
+    elif format == "yaml":
+        return yaml.dump(summary, default_flow_style=False, sort_keys=False)
+    else:  # markdown
+        lines = []
+        lines.append("# Pipeline Status")
+        lines.append("")
+
+        p = summary["pipeline"]
+        lines.append(f"**Status**: {p['status']}")
+        if p['started']:
+            lines.append(f"**Started**: {p['started']}")
+        if p['duration']:
+            lines.append(f"**Duration**: {p['duration']}")
+        lines.append("")
+
+        # Task summary
+        t = summary["task_summary"]
+        lines.append("## Task Summary")
+        lines.append(f"- Total: {t['total']}")
+        lines.append(f"- Succeeded: {t['succeeded']}")
+        lines.append(f"- Cached: {t['cached']}")
+        lines.append(f"- Failed: {t['failed']}")
+        lines.append(f"- Retries: {t['retries']}")
+        lines.append("")
+
+        # Sample progress
+        s = summary["samples"]
+        lines.append("## Sample Progress")
+        lines.append(f"- Complete: {len(s['complete'])}/{s['total']}")
+
+        if s['complete']:
+            lines.append(f"  - {', '.join(s['complete'][:10])}" +
+                        (f" (+{len(s['complete'])-10} more)" if len(s['complete']) > 10 else ""))
+
+        if s['in_progress']:
+            lines.append(f"- In Progress: {len(s['in_progress'])}")
+            for sample, stage in s['in_progress'].items():
+                lines.append(f"  - {sample}: {stage}")
+
+        if s['failed']:
+            lines.append(f"- Failed: {len(s['failed'])}")
+            for f in s['failed']:
+                lines.append(f"  - {f['sample']}: {f['stage']} ({f['error']})")
+        lines.append("")
+
+        # Cached tasks
+        c = summary["cached_tasks"]
+        if c['total'] > 0:
+            lines.append("## Cached Tasks")
+            lines.append(f"Total cached: {c['total']}")
+            for process, count in c['by_process'].items():
+                lines.append(f"- {process}: {count}")
+            lines.append("")
+
+        # Active jobs
+        j = summary["active_jobs"]
+        if j['count'] > 0:
+            lines.append("## Active SLURM Jobs")
+            lines.append(f"Count: {j['count']}")
+            for job in j['jobs'][:10]:
+                lines.append(f"- {job['job_id']}: {job['name']} ({job['state']}, {job['time']})")
+            lines.append("")
+
+        # Errors
+        if summary["errors"]:
+            lines.append("## Errors")
+            for e in summary["errors"]:
+                lines.append(f"### {e['sample']} - {e['process']}")
+                lines.append(f"- Exit code: {e['exit_code']}")
+                lines.append(f"- Retries: {e['retry_count']}")
+                if e.get('error_message'):
+                    lines.append(f"- Error: ```{e['error_message'][:200]}```")
+                lines.append("")
+
+        return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check Nextflow pipeline status",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --outdir /path/to/output
+  %(prog)s --outdir /path/to/output --format yaml
+  %(prog)s --outdir /path/to/output --format json | jq '.samples.complete'
+        """
+    )
+
+    parser.add_argument(
+        "--outdir", "-o",
+        required=True,
+        type=Path,
+        help="Pipeline output directory (contains logs/nextflow.log)",
+    )
+    parser.add_argument(
+        "--format", "-f",
+        choices=["yaml", "json", "markdown"],
+        default="yaml",
+        help="Output format (default: yaml)",
+    )
+    parser.add_argument(
+        "--user", "-u",
+        default=os.environ.get("USER", ""),
+        help="SLURM user for job query (default: current user)",
+    )
+    parser.add_argument(
+        "--job-prefix", "-j",
+        default="nf-",
+        help="SLURM job name prefix filter (default: nf-)",
+    )
+    parser.add_argument(
+        "--samples", "-s",
+        nargs="+",
+        help="List of expected sample IDs (optional)",
+    )
+
+    args = parser.parse_args()
+
+    if not args.outdir.exists():
+        print(f"Error: Output directory does not exist: {args.outdir}", file=sys.stderr)
+        sys.exit(1)
+
+    summary = generate_summary(
+        outdir=args.outdir,
+        user=args.user,
+        job_prefix=args.job_prefix,
+        samples=args.samples,
+    )
+
+    output = format_output(summary, args.format)
+    print(output)
+
+
+if __name__ == "__main__":
+    main()
