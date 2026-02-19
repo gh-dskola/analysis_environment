@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from collections import defaultdict
@@ -27,6 +28,10 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
+
+# Handle SIGPIPE gracefully for piping to tools like head, jq, python
+# Without this, piping to a command that closes early causes BrokenPipeError
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 
 @dataclass
@@ -56,6 +61,18 @@ class SampleStatus:
 
 
 @dataclass
+class TaskOutcome:
+    """Resolved final outcome of a logical task across all its retry attempts."""
+    task_name: str
+    process: str
+    sample: str
+    final_status: str  # "COMPLETED", "CACHED", or "FAILED"
+    attempts: int
+    failed_attempts: int
+    last_exit_code: Optional[int] = None
+
+
+@dataclass
 class PipelineStatus:
     """Overall pipeline status."""
     status: str = "unknown"
@@ -75,6 +92,7 @@ class PipelineStatus:
 # Define pipeline stage order for progress tracking
 STAGE_ORDER = [
     "RECORD_RUN_METADATA",
+    # Alignment/Manta path
     "BUILD_ALIGNMENT_CONTAINER",
     "TRIM_ALIGN_SORT",
     "SPLIT_FASTQ",
@@ -86,15 +104,62 @@ STAGE_ORDER = [
     "BUILD_MANTA_POST_CONTAINER",
     "MANTA_SOMATIC",
     "POST_PROCESS_MANTA",
+    # Fusion/ABFusion path
+    "BUILD_FUSION_ALIGNMENT_CONTAINER",
+    "FUSION_ALIGN_PART",
+    "FUSION_ALIGN_MERGE",
+    "BUILD_FUSIONCALLER_BINARIES",
+    "BUILD_ABFUSION_CONTAINER",
+    "ABFUSION_CALL",
+    "ABFUSION_FILTER",
 ]
 
 
-def parse_execution_trace(trace_path: Path) -> dict[str, TaskInfo]:
-    """Parse execution_trace.txt for task information."""
+def _extract_process_and_sample(name: str) -> tuple[str, str]:
+    """Extract process name and normalized sample ID from a task name.
+
+    Args:
+        name: Full task name, e.g. "from_fastq:ABFUSION:ABFUSION_CALL (A1093741_tumor)"
+
+    Returns:
+        Tuple of (process, sample) where sample is normalized (stripped of
+        _tumor/_normal suffixes and _partN suffixes).
+    """
+    process = ""
+    sample = ""
+    if name:
+        process_match = re.search(r':?([A-Z_]+)\s*\(', name)
+        if process_match:
+            process = process_match.group(1)
+
+        sample_match = re.search(r'\(([^)]+)\)', name)
+        if sample_match:
+            sample = sample_match.group(1)
+            sample = re.sub(r'_(tumor|normal).*$', '', sample)
+            sample = re.sub(r'_part\d+$', '', sample)
+
+    return process, sample
+
+
+def parse_execution_trace(
+    trace_path: Path,
+) -> tuple[dict[str, TaskInfo], dict[str, TaskOutcome]]:
+    """Parse execution_trace.txt for task information and resolve final outcomes.
+
+    Groups trace entries by task name and determines whether each logical task
+    ultimately succeeded (any attempt COMPLETED/CACHED) or permanently failed
+    (all attempts FAILED).
+
+    Returns:
+        tasks: Individual task entries keyed by hash:process:sample.
+        task_outcomes: Final resolved outcomes keyed by full task name,
+            grouping all retry attempts of each logical task.
+    """
     tasks = {}
+    tasks_by_name: dict[str, list[TaskInfo]] = defaultdict(list)
 
     if not trace_path.exists():
-        return tasks
+        return tasks, {}
 
     with open(trace_path) as f:
         header = None
@@ -121,23 +186,7 @@ def parse_execution_trace(trace_path: Path) -> dict[str, TaskInfo]:
             duration = row.get('duration', row.get('realtime', ''))
             work_dir = row.get('workdir', '')
 
-            # Extract process name and sample from task name
-            # Format: "workflow:SUBWORKFLOW:PROCESS (sample_id)"
-            process = ""
-            sample = ""
-            if name:
-                # Extract process name (last part before parentheses)
-                process_match = re.search(r':?([A-Z_]+)\s*\(', name)
-                if process_match:
-                    process = process_match.group(1)
-
-                # Extract sample ID from parentheses
-                sample_match = re.search(r'\(([^)]+)\)', name)
-                if sample_match:
-                    sample = sample_match.group(1)
-                    # Clean up sample name (remove _tumor, _normal, part info)
-                    sample = re.sub(r'_(tumor|normal).*$', '', sample)
-                    sample = re.sub(r'_part\d+$', '', sample)
+            process, sample = _extract_process_and_sample(name)
 
             task = TaskInfo(
                 task_id=task_id,
@@ -153,15 +202,56 @@ def parse_execution_trace(trace_path: Path) -> dict[str, TaskInfo]:
             # Use task_id + process + sample as key to handle retries
             key = f"{task_id}:{process}:{sample}"
             tasks[key] = task
+            tasks_by_name[name].append(task)
 
-    return tasks
+    # Resolve final outcome for each logical task
+    task_outcomes = {}
+    for task_name, attempts in tasks_by_name.items():
+        if not task_name:
+            continue
+
+        any_succeeded = any(
+            t.status in ('COMPLETED', 'CACHED') for t in attempts
+        )
+        failed_attempts = [t for t in attempts if t.status == 'FAILED']
+        last_attempt = attempts[-1]  # trace is ordered chronologically
+
+        process, sample = _extract_process_and_sample(task_name)
+
+        if any_succeeded:
+            final_status = "COMPLETED"
+        else:
+            final_status = "FAILED"
+
+        task_outcomes[task_name] = TaskOutcome(
+            task_name=task_name,
+            process=process,
+            sample=sample,
+            final_status=final_status,
+            attempts=len(attempts),
+            failed_attempts=len(failed_attempts),
+            last_exit_code=last_attempt.exit_code,
+        )
+
+    return tasks, task_outcomes
 
 
-def parse_nextflow_log(log_path: Path) -> tuple[PipelineStatus, list[dict]]:
-    """Parse nextflow.log for pipeline status and error details."""
+def parse_nextflow_log(
+    log_path: Path,
+    task_outcomes: dict[str, TaskOutcome],
+) -> tuple[PipelineStatus, list[dict]]:
+    """Parse nextflow.log for pipeline status and permanent error details.
+
+    Only reports permanently failed tasks (where the error was ignored after
+    exhausting retries or because the exit code wasn't retryable). Transient
+    retry events are counted as a summary stat (``pipeline.retries``) but not
+    reported as errors.
+
+    Cross-references with *task_outcomes* from the execution trace to confirm
+    that the task did not eventually succeed on a later attempt.
+    """
     pipeline = PipelineStatus()
     errors = []
-    retries = defaultdict(list)
 
     if not log_path.exists():
         return pipeline, errors
@@ -208,48 +298,42 @@ def parse_nextflow_log(log_path: Path) -> tuple[PipelineStatus, list[dict]]:
     if failed_match:
         pipeline.failed = int(failed_match.group(1))
 
-    # Find retry events and their reasons
+    # Count retry events as a summary stat (not errors)
     retry_pattern = re.compile(
-        r'Process `([^`]+)` terminated with an error exit status \((\d+)\) -- Execution is retried \((\d+)\)'
+        r'Process `[^`]+` terminated with an error exit status \(\d+\) -- Execution is retried \(\d+\)'
     )
-    for match in retry_pattern.finditer(content):
-        process_name = match.group(1)
+    pipeline.retries = len(retry_pattern.findall(content))
+
+    # Find permanently failed tasks: "Error is ignored" means all retries
+    # exhausted (or exit code wasn't retryable) and the task was abandoned
+    ignored_pattern = re.compile(
+        r'Process `([^`]+)` terminated with an error exit status \((\d+)\) -- Error is ignored'
+    )
+    for match in ignored_pattern.finditer(content):
+        full_process_name = match.group(1)
         exit_code = int(match.group(2))
-        retry_num = int(match.group(3))
 
         # Extract sample from process name
-        sample_match = re.search(r'\(([^)]+)\)', process_name)
+        sample_match = re.search(r'\(([^)]+)\)', full_process_name)
         sample = sample_match.group(1) if sample_match else "unknown"
 
         # Extract just the process type
-        process_match = re.search(r':([A-Z_]+)\s*\(', process_name)
-        process = process_match.group(1) if process_match else process_name
+        process_match = re.search(r':([A-Z_]+)\s*\(', full_process_name)
+        process = process_match.group(1) if process_match else full_process_name
 
-        retries[f"{process}:{sample}"].append({
-            "retry_num": retry_num,
-            "exit_code": exit_code,
-        })
-
-    # Find error messages in log
-    error_pattern = re.compile(
-        r'(\w{3}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+).*ERROR.*?(?:Process `([^`]+)`.*?|)(?:error[:\s]+(.+?)(?:\n|$))',
-        re.IGNORECASE
-    )
-
-    # Also look for specific error patterns
-    for process_sample, retry_list in retries.items():
-        process, sample = process_sample.split(':', 1)
-        latest_retry = max(retry_list, key=lambda x: x['retry_num'])
+        # Cross-reference with task_outcomes: skip if the task eventually
+        # succeeded (e.g. a later retry completed after the ignore)
+        outcome = task_outcomes.get(full_process_name)
+        if outcome and outcome.final_status != "FAILED":
+            continue
 
         errors.append({
             "sample": sample,
             "process": process,
-            "exit_code": latest_retry['exit_code'],
-            "retry_count": latest_retry['retry_num'],
+            "exit_code": exit_code,
+            "retry_count": outcome.attempts - 1 if outcome else 0,
             "error_message": None,  # Will be populated from .command.err if found
         })
-
-    pipeline.retries = sum(len(v) for v in retries.values())
 
     return pipeline, errors
 
@@ -392,10 +476,17 @@ def parse_console_output(log_path: Path) -> dict:
 
 def determine_sample_status(
     tasks: dict[str, TaskInfo],
+    task_outcomes: dict[str, TaskOutcome],
     complete_samples: set[str],
     all_samples: set[str],
 ) -> dict[str, SampleStatus]:
-    """Determine the current status of each sample."""
+    """Determine the current status of each sample.
+
+    Uses *task_outcomes* (resolved final outcomes) to decide whether a sample
+    has permanently failed.  A sample is only marked as failed if at least one
+    of its logical tasks has ``final_status == "FAILED"`` — transient retries
+    that eventually succeeded are not counted.
+    """
     sample_status = {}
 
     # Group tasks by sample
@@ -406,10 +497,33 @@ def determine_sample_status(
             sample = re.sub(r'_(tumor|normal).*$', '', task.sample)
             tasks_by_sample[sample].append(task)
 
+    # Group task outcomes by (normalized) sample for efficient lookup
+    outcomes_by_sample: dict[str, list[TaskOutcome]] = defaultdict(list)
+    for outcome in task_outcomes.values():
+        if outcome.sample:
+            outcomes_by_sample[outcome.sample].append(outcome)
+
     for sample in all_samples:
         status = SampleStatus(sample_id=sample)
 
-        if sample in complete_samples:
+        # Check for permanently failed tasks first — a sample with any
+        # permanently-failed task is "failed" even if other paths (e.g.
+        # Manta) completed successfully.
+        failed_outcomes = [
+            o for o in outcomes_by_sample.get(sample, [])
+            if o.final_status == "FAILED"
+        ]
+        if failed_outcomes:
+            status.has_error = True
+            worst = failed_outcomes[0]
+            status.error_details = (
+                f"Exit code {worst.last_exit_code} in {worst.process}"
+            )
+            status.retry_count = max(
+                o.attempts - 1 for o in failed_outcomes
+            )
+
+        if not status.has_error and sample in complete_samples:
             status.current_stage = "COMPLETE"
             status.stages_complete = STAGE_ORDER.copy()
         else:
@@ -431,12 +545,6 @@ def determine_sample_status(
                         if idx > latest_stage_idx:
                             latest_stage_idx = idx
                             latest_stage = task.process
-
-                # Track errors
-                if task.exit_code and task.exit_code != 0:
-                    status.has_error = True
-                    status.error_details = f"Exit code {task.exit_code} in {task.process}"
-                    status.retry_count = max(status.retry_count, task.retry_count)
 
             status.stages_complete = [s for s in STAGE_ORDER if s in completed_processes]
 
@@ -472,8 +580,8 @@ def generate_summary(
     log_path = outdir / "logs" / "nextflow.log"
 
     # Parse all data sources
-    tasks = parse_execution_trace(trace_path)
-    pipeline, errors = parse_nextflow_log(log_path)
+    tasks, task_outcomes = parse_execution_trace(trace_path)
+    pipeline, errors = parse_nextflow_log(log_path, task_outcomes=task_outcomes)
     slurm_jobs = get_slurm_jobs(user, job_prefix)
     console_progress = parse_console_output(log_path)
 
@@ -496,7 +604,9 @@ def generate_summary(
                 all_samples.add(sample)
 
     complete_samples = console_progress.get("samples_complete", set())
-    sample_status = determine_sample_status(tasks, complete_samples, all_samples)
+    sample_status = determine_sample_status(
+        tasks, task_outcomes, complete_samples, all_samples,
+    )
 
     # Calculate cached statistics
     cached_tasks = [t for t in tasks.values() if t.cached]
@@ -538,18 +648,18 @@ def generate_summary(
         "process_progress": console_progress.get("processes", {}),
     }
 
-    # Categorize samples
+    # Categorize samples — errors take precedence over completion
     for sample_id, status in sample_status.items():
-        if status.current_stage == "COMPLETE":
-            if sample_id not in summary["samples"]["complete"]:
-                summary["samples"]["complete"].append(sample_id)
-        elif status.has_error:
+        if status.has_error:
             summary["samples"]["failed"].append({
                 "sample": sample_id,
                 "stage": status.current_stage,
                 "error": status.error_details,
                 "retries": status.retry_count,
             })
+        elif status.current_stage == "COMPLETE":
+            if sample_id not in summary["samples"]["complete"]:
+                summary["samples"]["complete"].append(sample_id)
         else:
             summary["samples"]["in_progress"][sample_id] = status.current_stage
 
@@ -693,7 +803,7 @@ Examples:
     )
 
     output = format_output(summary, args.format)
-    print(output)
+    print(output, flush=True)
 
 
 if __name__ == "__main__":
