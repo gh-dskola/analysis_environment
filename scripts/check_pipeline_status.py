@@ -47,6 +47,7 @@ class TaskInfo:
     retry_count: int = 0
     error_message: Optional[str] = None
     work_dir: Optional[str] = None
+    native_id: Optional[str] = None
 
 
 @dataclass
@@ -70,6 +71,7 @@ class TaskOutcome:
     attempts: int
     failed_attempts: int
     last_exit_code: Optional[int] = None
+    last_native_id: Optional[str] = None
 
 
 @dataclass
@@ -185,6 +187,7 @@ def parse_execution_trace(
             exit_code = row.get('exit', '')
             duration = row.get('duration', row.get('realtime', ''))
             work_dir = row.get('workdir', '')
+            native_id = row.get('native_id', '')
 
             process, sample = _extract_process_and_sample(name)
 
@@ -197,6 +200,7 @@ def parse_execution_trace(
                 duration=duration if duration and duration != '-' else None,
                 cached=status == 'CACHED',
                 work_dir=work_dir,
+                native_id=native_id if native_id and native_id != '-' else None,
             )
 
             # Use task_id + process + sample as key to handle retries
@@ -231,6 +235,7 @@ def parse_execution_trace(
             attempts=len(attempts),
             failed_attempts=len(failed_attempts),
             last_exit_code=last_attempt.exit_code,
+            last_native_id=last_attempt.native_id,
         )
 
     return tasks, task_outcomes
@@ -333,6 +338,7 @@ def parse_nextflow_log(
             "exit_code": exit_code,
             "retry_count": outcome.attempts - 1 if outcome else 0,
             "error_message": None,  # Will be populated from .command.err if found
+            "native_id": outcome.last_native_id if outcome else None,
         })
 
     return pipeline, errors
@@ -421,6 +427,115 @@ def get_slurm_jobs(user: str, job_prefix: str) -> list[dict]:
         pass
 
     return jobs
+
+
+def get_slurm_job_accounting(job_ids: list[str]) -> dict[str, dict]:
+    """Query sacct for SLURM accounting data on completed jobs.
+
+    Batch-queries sacct for the given SLURM job IDs and returns failure
+    reason and peak memory usage for each.
+
+    Args:
+        job_ids: List of SLURM job ID strings to query.
+
+    Returns:
+        Dict keyed by job ID with keys:
+            slurm_state: str  (e.g. "OUT_OF_MEMORY", "TIMEOUT", "FAILED", "COMPLETED")
+            peak_rss: str|None  (human-readable, e.g. "94.3 GB")
+    """
+    if not job_ids:
+        return {}
+
+    try:
+        result = subprocess.run(
+            [
+                'sacct', '-j', ','.join(job_ids),
+                '--format=JobID,State,MaxRSS',
+                '--noheader', '--parsable2',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            return {}
+    except Exception:
+        return {}
+
+    # Parse output: main job line (no '.' in JobID) gives State;
+    # '.batch' substep gives MaxRSS
+    states: dict[str, str] = {}
+    max_rss: dict[str, str] = {}
+
+    for line in result.stdout.strip().split('\n'):
+        if not line:
+            continue
+        parts = line.split('|')
+        if len(parts) < 3:
+            continue
+
+        job_id_field = parts[0].strip()
+        state_field = parts[1].strip()
+        rss_field = parts[2].strip()
+
+        if '.' not in job_id_field:
+            # Main job line — extract state (strip trailing modifiers like
+            # "CANCELLED by ..." but keep core state)
+            state = state_field.split()[0] if state_field else ""
+            states[job_id_field] = state
+        elif job_id_field.endswith('.batch'):
+            # Batch substep — extract MaxRSS
+            base_id = job_id_field.split('.')[0]
+            if rss_field:
+                max_rss[base_id] = rss_field
+
+    # Build result dict with human-readable peak_rss
+    accounting: dict[str, dict] = {}
+    for job_id in job_ids:
+        if job_id not in states:
+            continue
+        rss_str = max_rss.get(job_id)
+        peak_rss = _format_rss(rss_str) if rss_str else None
+        accounting[job_id] = {
+            "slurm_state": states[job_id],
+            "peak_rss": peak_rss,
+        }
+
+    return accounting
+
+
+def _format_rss(rss_str: str) -> Optional[str]:
+    """Convert sacct MaxRSS value (e.g. '98765432K') to human-readable form.
+
+    sacct reports MaxRSS with a suffix of K (kibibytes), M, G, or T.
+    Returns a string like '94.3 GB' or None if parsing fails.
+    """
+    rss_str = rss_str.strip()
+    if not rss_str:
+        return None
+
+    multipliers = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
+    suffix = rss_str[-1].upper()
+    if suffix in multipliers:
+        try:
+            value_bytes = float(rss_str[:-1]) * multipliers[suffix]
+        except ValueError:
+            return rss_str
+    else:
+        try:
+            value_bytes = float(rss_str)
+        except ValueError:
+            return rss_str
+
+    # Convert to most appropriate unit
+    gb = value_bytes / (1024**3)
+    if gb >= 1.0:
+        return f"{gb:.1f} GB"
+    mb = value_bytes / (1024**2)
+    if mb >= 1.0:
+        return f"{mb:.1f} MB"
+    return f"{value_bytes / 1024:.1f} KB"
 
 
 def parse_console_output(log_path: Path) -> dict:
@@ -592,6 +707,18 @@ def generate_summary(
             error['error_message'] = get_error_from_workdir(work_dir)
             error['work_dir'] = work_dir
 
+    # Enrich errors with SLURM accounting data (failure reason, peak memory)
+    native_ids = [
+        e['native_id'] for e in errors if e.get('native_id')
+    ]
+    if native_ids:
+        accounting = get_slurm_job_accounting(native_ids)
+        for error in errors:
+            nid = error.get('native_id')
+            if nid and nid in accounting:
+                error['slurm_state'] = accounting[nid].get('slurm_state')
+                error['peak_rss'] = accounting[nid].get('peak_rss')
+
     # Determine all samples
     all_samples = set()
     if samples:
@@ -741,6 +868,10 @@ def format_output(summary: dict, format: str) -> str:
             for e in summary["errors"]:
                 lines.append(f"### {e['sample']} - {e['process']}")
                 lines.append(f"- Exit code: {e['exit_code']}")
+                if e.get('slurm_state'):
+                    lines.append(f"- SLURM state: {e['slurm_state']}")
+                if e.get('peak_rss'):
+                    lines.append(f"- Peak RSS: {e['peak_rss']}")
                 lines.append(f"- Retries: {e['retry_count']}")
                 if e.get('error_message'):
                     lines.append(f"- Error: ```{e['error_message'][:200]}```")
