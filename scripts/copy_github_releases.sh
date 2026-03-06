@@ -31,7 +31,7 @@ trap 'rm -rf "$asset_dir"' EXIT
 echo "Copying releases from ${source_repo} to ${target_repo}..."
 
 # Fetch all releases from the source repo
-releases_json="$(gh release list --repo "$source_repo" --json tagName,name,body,isDraft,isPrerelease --limit 1000)"
+releases_json="$(gh release list --repo "$source_repo" --json tagName,name,isDraft,isPrerelease --limit 1000)"
 
 release_count="$(echo "$releases_json" | jq 'length')"
 if [[ "$release_count" -eq 0 ]]; then
@@ -47,7 +47,6 @@ existing_tags="$(gh release list --repo "$target_repo" --json tagName --limit 10
 echo "$releases_json" | jq -c '.[]' | while read -r rel; do
     tag="$(echo "$rel" | jq -r '.tagName')"
     name="$(echo "$rel" | jq -r '.name')"
-    body="$(echo "$rel" | jq -r '.body')"
     is_draft="$(echo "$rel" | jq -r '.isDraft')"
     is_prerelease="$(echo "$rel" | jq -r '.isPrerelease')"
 
@@ -58,6 +57,9 @@ echo "$releases_json" | jq -c '.[]' | while read -r rel; do
     fi
 
     echo "  Copying release ${tag}..."
+
+    # Fetch release body (not available from 'gh release list')
+    body="$(gh release view "$tag" --repo "$source_repo" --json body --jq '.body')"
 
     # Build flags for draft/prerelease
     release_flags=()
